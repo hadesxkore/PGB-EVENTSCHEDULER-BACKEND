@@ -30,21 +30,6 @@ RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
 
 WORKDIR /app
 
-# Accept environment variables as build arguments
-ARG MONGODB_URI
-ARG JWT_SECRET
-ARG JWT_EXPIRES_IN
-ARG PORT
-ARG NODE_ENV
-ARG CORS_ORIGINS
-
-# Expose them at runtime
-ENV MONGODB_URI=${MONGODB_URI}
-ENV JWT_SECRET=${JWT_SECRET}
-ENV JWT_EXPIRES_IN=${JWT_EXPIRES_IN}
-ENV PORT=${PORT}
-ENV NODE_ENV=${NODE_ENV}
-ENV CORS_ORIGINS=${CORS_ORIGINS}
 
 # Copy package files and install ONLY production dependencies
 # (no TypeScript, no nodemon, no ts-node — saves ~150-300MB)
