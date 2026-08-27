@@ -74,9 +74,11 @@ const autoApproveUrgentEvents = async (io: any) => {
     cutoff.setHours(23, 59, 59, 999);
 
     // Find all submitted events whose startDate is on or before the cutoff
+    // Exclude BAC location events — BAC has sole authority to approve/reject those
     const urgentEvents = await Event.find({
       status: 'submitted',
-      startDate: { $lte: cutoff }
+      startDate: { $lte: cutoff },
+      location: { $ne: '5th Flr. Training Room 1 (BAC)' }
     });
 
     let approvedCount = 0;
