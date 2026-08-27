@@ -25,8 +25,6 @@ RUN npm run build
 # ─────────────────────────────────────────────────────────────
 FROM node:20-alpine
 
-RUN apk add --no-cache curl
-
 # Non-root user for security
 RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
 
@@ -64,6 +62,6 @@ USER nodejs
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD sh -c 'curl -f "http://localhost:3000/api/health" || exit 1'
+  CMD node -e "fetch('http://localhost:3000/api/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
 CMD ["node", "dist/server.js"]

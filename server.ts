@@ -38,16 +38,16 @@ const app = express();
 const httpServer = createServer(app);
 
 const defaultOrigins = [
-  "http://localhost:5173", 
-  "http://localhost:5174", 
-  "http://localhost:8080", 
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:8080",
   "http://localhost:3000",
   "http://127.0.0.1:5173",
   "https://eventscheduler.bataan.gov.ph",
   "https://eventscheduler-api.bataan.gov.ph"
 ];
 
-const envOrigins = process.env.CORS_ORIGINS 
+const envOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
   : [];
 
@@ -99,7 +99,7 @@ console.log('🔐 CORS Allowed Origins:', allowedOrigins);
 // Manual CORS headers for preflight - MUST come before cors middleware
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  
+
   // Check if origin is allowed
   if (origin && allowedOrigins.includes(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
@@ -110,12 +110,12 @@ app.use((req, res, next) => {
   } else if (origin) {
     console.log('❌ CORS rejected origin:', origin);
   }
-  
+
   // Handle preflight
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
-  
+
   next();
 });
 
@@ -126,7 +126,7 @@ app.use(cors({
     if (!origin) {
       return callback(null, true);
     }
-    
+
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -226,7 +226,7 @@ app.get('/api/health', (req, res) => {
 app.post('/api/cleanup-now', async (req, res) => {
   try {
     const result = await runCleanupNow();
-    
+
     res.json({
       success: true,
       message: 'Cleanup completed successfully',
@@ -249,19 +249,19 @@ const connectDB = async () => {
     }
 
     console.log('🔄 Connecting to MongoDB Atlas...');
-    
+
     await mongoose.connect(MONGODB_URI);
-    
+
     console.log('✅ MongoDB Atlas connected successfully!');
     console.log(`📊 Database: ${mongoose.connection.db?.databaseName}`);
-    
+
     // Seed initial admin user if database has no users or AUTO_SEED_ADMIN is true
     await seedInitialAdminIfNeeded();
 
     // Start the automated scheduler with Socket.IO instance
     const io = app.get('io');
     startScheduler(io);
-    
+
   } catch (error) {
     console.error('❌ MongoDB connection failed:', error);
     process.exit(1);
@@ -308,7 +308,7 @@ const seedInitialAdminIfNeeded = async () => {
 const startServer = async () => {
   try {
     await connectDB();
-    
+
     httpServer.listen(PORT, '0.0.0.0' as any, () => {
       console.log('🚀 PGB Event Scheduler Backend Server Started!');
       console.log(`📡 Server running on: http://0.0.0.0:${PORT}`);
