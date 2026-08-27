@@ -28,7 +28,7 @@ async function createAdmin() {
   const email = args[1] || process.env.ADMIN_EMAIL || 'admin@bataan.gov.ph';
   const password = args[2] || process.env.ADMIN_PASSWORD || 'Admin@2025!';
   const department = args[3] || process.env.ADMIN_DEPT || 'PGO';
-  const role = (args[4] || process.env.ADMIN_ROLE || 'Admin') as 'Admin' | 'superadmin';
+  const role = (args[4] || process.env.ADMIN_ROLE || 'superadmin') as 'Admin' | 'superadmin';
 
   console.log('🔄 Connecting to MongoDB...');
   await mongoose.connect(MONGODB_URI);

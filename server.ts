@@ -25,14 +25,8 @@ import User from './models/User.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load environment variables (only if .env file exists - in Docker, use ENV vars instead)
-try {
-  const envPath = path.join(__dirname, '.env');
-  dotenv.config({ path: envPath });
-} catch (error) {
-  // Silently fail if .env doesn't exist (expected in Docker)
-  console.log('ℹ️ No .env file found (expected in Docker - using environment variables)');
-}
+// Load environment variables (.env file locally, or system ENV in Docker/Coolify)
+dotenv.config();
 
 const app = express();
 const httpServer = createServer(app);
@@ -244,15 +238,17 @@ app.post('/api/cleanup-now', async (req, res) => {
 // MongoDB Connection
 const connectDB = async () => {
   try {
-    if (!MONGODB_URI) {
+    const rawUri = (process.env.MONGODB_URI || process.env.MONGO_URI || '').trim().replace(/^["']|["']$/g, '');
+    
+    if (!rawUri) {
       throw new Error('MONGODB_URI is not defined in environment variables');
     }
 
-    console.log('🔄 Connecting to MongoDB Atlas...');
+    console.log(`🔄 Connecting to MongoDB (Prefix: "${rawUri.substring(0, 15)}...")...`);
 
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(rawUri);
 
-    console.log('✅ MongoDB Atlas connected successfully!');
+    console.log('✅ MongoDB connected successfully!');
     console.log(`📊 Database: ${mongoose.connection.db?.databaseName}`);
 
     // Seed initial admin user if database has no users or AUTO_SEED_ADMIN is true
@@ -286,14 +282,14 @@ const seedInitialAdminIfNeeded = async () => {
           email,
           password,
           department,
-          role: 'Admin',
+          role: 'superadmin',
           status: 'active'
         });
         await adminUser.save();
-        console.log(`👑 Initial Admin account created: "${username}" (Role: Admin)`);
+        console.log(`👑 Initial Admin account created: "${username}" (Role: superadmin)`);
       } else if (process.env.AUTO_SEED_ADMIN === 'true') {
         existingAdmin.password = password;
-        existingAdmin.role = 'Admin';
+        existingAdmin.role = 'superadmin';
         existingAdmin.status = 'active';
         await existingAdmin.save();
         console.log(`👑 Initial Admin account updated: "${username}"`);
