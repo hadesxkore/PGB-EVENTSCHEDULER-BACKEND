@@ -8,7 +8,8 @@
     "start": "node dist/server.js",
     "dev": "tsx watch server.ts",
     "backend": "tsx server.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "create-admin": "node dist/scripts/createAdmin.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

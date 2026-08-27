@@ -19,6 +19,7 @@ import notificationRoutes from './routes/notifications.js';
 import loginLogsRoutes from './routes/loginLogs.js';
 import userActivityLogsRoutes from './routes/userActivityLogs.js';
 import { startScheduler, runCleanupNow } from './services/scheduler.js';
+import User from './models/User.js';
 
 // ES module __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -36,16 +37,21 @@ try {
 const app = express();
 const httpServer = createServer(app);
 
-// CORS allowed origins from environment variable or defaults
-const allowedOrigins = process.env.CORS_ORIGINS 
-  ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
-  : [
-      "http://localhost:5173", 
-      "http://localhost:8080", 
-      "http://localhost:3000",
-      "https://eventscheduler.bataan.gov.ph",
-      "https://eventscheduler-api.bataan.gov.ph"
-    ];
+const defaultOrigins = [
+  "http://localhost:5173", 
+  "http://localhost:5174", 
+  "http://localhost:8080", 
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "https://eventscheduler.bataan.gov.ph",
+  "https://eventscheduler-api.bataan.gov.ph"
+];
+
+const envOrigins = process.env.CORS_ORIGINS 
+  ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
+  : [];
+
+const allowedOrigins = Array.from(new Set([...defaultOrigins, ...envOrigins]));
 
 // Re-enable Socket.IO server with proper connection management
 const io = new Server(httpServer, {
@@ -73,7 +79,8 @@ app.set('io', io);
 
 // Use port 3000 by default. Ignore PORT env var if it's 5000 (Coolify default)
 const PORT = (process.env.PORT && process.env.PORT !== '5000') ? parseInt(process.env.PORT) : 3000;
-const MONGODB_URI = process.env.MONGODB_URI;
+const rawMongoUri = (process.env.MONGODB_URI || process.env.MONGO_URI || '').trim().replace(/^["']|["']$/g, '');
+const MONGODB_URI = rawMongoUri;
 
 // Trust proxy - required for Coolify/reverse proxy setups
 app.set('trust proxy', 1);
@@ -248,6 +255,9 @@ const connectDB = async () => {
     console.log('✅ MongoDB Atlas connected successfully!');
     console.log(`📊 Database: ${mongoose.connection.db?.databaseName}`);
     
+    // Seed initial admin user if database has no users or AUTO_SEED_ADMIN is true
+    await seedInitialAdminIfNeeded();
+
     // Start the automated scheduler with Socket.IO instance
     const io = app.get('io');
     startScheduler(io);
@@ -255,6 +265,42 @@ const connectDB = async () => {
   } catch (error) {
     console.error('❌ MongoDB connection failed:', error);
     process.exit(1);
+  }
+};
+
+const seedInitialAdminIfNeeded = async () => {
+  try {
+    const userCount = await User.countDocuments();
+    const shouldSeed = userCount === 0 || process.env.AUTO_SEED_ADMIN === 'true';
+
+    if (shouldSeed) {
+      const username = process.env.INITIAL_ADMIN_USERNAME || 'pgo.superadmin';
+      const email = process.env.INITIAL_ADMIN_EMAIL || 'admin@bataan.gov.ph';
+      const password = process.env.INITIAL_ADMIN_PASSWORD || 'SuperAdmin@2025!';
+      const department = process.env.INITIAL_ADMIN_DEPT || 'PGO';
+
+      const existingAdmin = await User.findOne({ username });
+      if (!existingAdmin) {
+        const adminUser = new User({
+          username,
+          email,
+          password,
+          department,
+          role: 'Admin',
+          status: 'active'
+        });
+        await adminUser.save();
+        console.log(`👑 Initial Admin account created: "${username}" (Role: Admin)`);
+      } else if (process.env.AUTO_SEED_ADMIN === 'true') {
+        existingAdmin.password = password;
+        existingAdmin.role = 'Admin';
+        existingAdmin.status = 'active';
+        await existingAdmin.save();
+        console.log(`👑 Initial Admin account updated: "${username}"`);
+      }
+    }
+  } catch (err) {
+    console.error('⚠️ Could not check/seed initial admin:', err);
   }
 };
 
