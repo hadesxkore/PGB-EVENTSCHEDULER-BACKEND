@@ -7,6 +7,7 @@ import ResourceAvailability from '../models/ResourceAvailability.js';
 import LocationAvailability from '../models/LocationAvailability.js';
 import Department from '../models/Department.js';
 import User from '../models/User.js';
+import DepartmentPermissions from '../models/DepartmentPermissions.js';
 import { authenticateToken } from '../middleware/auth.js';
 import multer from 'multer';
 import path from 'path';
@@ -948,14 +949,24 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     }
 
     // Permission rules:
-    // - Admin/superadmin can approve/reject/cancel.
+    // - Admin/superadmin or PGSO (or users with allEvents permission) can approve/reject/cancel.
     // - Requestor (event owner) can ONLY cancel, and only before approval.
     const user = (req as any).user;
     const userRole = String(user?.role || '').toLowerCase();
+    const userDepartment = String(user?.department || '').trim().toUpperCase();
     const isAdmin = userRole === 'admin' || userRole === 'superadmin';
+    const isPgso = userDepartment === 'PGSO';
+
+    let hasAllEventsAccess = isAdmin || isPgso;
+    if (!hasAllEventsAccess && userDepartment) {
+      const deptPerm = await DepartmentPermissions.findOne({ department: userDepartment });
+      if (deptPerm?.permissions?.allEvents) {
+        hasAllEventsAccess = true;
+      }
+    }
     const isOwner = user?._id && event.createdBy && event.createdBy.toString() === user._id.toString();
 
-    if (!isAdmin) {
+    if (!hasAllEventsAccess) {
       if (!isOwner) {
         return res.status(403).json({
           success: false,
@@ -1031,7 +1042,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
       updateData.departmentRequirements = departmentRequirements;
 
       // If requestor cancelled and no reason provided, use a default
-      if (!isAdmin && isOwner && (!reason || !String(reason).trim())) {
+      if (!hasAllEventsAccess && isOwner && (!reason || !String(reason).trim())) {
         updateData.reason = 'Requestor cancelled';
       }
 
@@ -1105,9 +1116,9 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     // Emit Socket.IO event for real-time updates
     const io = req.app.get('io');
     if (io) {
-      // Get admin name for notification
+      // Get admin/updater name for notification
       const adminUser = (req as any).user;
-      const adminName = adminUser?.name || 'Admin';
+      const adminName = adminUser?.name || adminUser?.username || (isAdmin ? 'Admin' : isPgso ? 'PGSO' : 'Department Admin');
 
       const tz = 'Asia/Manila';
       const toDateOnly = (d: any): string | null => {
@@ -1888,18 +1899,30 @@ router.post('/', authenticateToken, upload.fields([
   }
 });
 
-// PUT /api/events/:id/status - Update event status (Admin only)
+// PUT /api/events/:id/status - Update event status (Admin and PGSO)
 router.put('/:id/status', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
-    const userRole = (req as any).user.role;
+    const user = (req as any).user;
+    const userRole = String(user?.role || '').toLowerCase();
+    const userDepartment = String(user?.department || '').trim().toUpperCase();
+    const isAdmin = userRole === 'admin' || userRole === 'superadmin';
+    const isPgso = userDepartment === 'PGSO';
 
-    // Check if user is admin
-    if (userRole !== 'admin') {
+    let hasAllEventsAccess = isAdmin || isPgso;
+    if (!hasAllEventsAccess && userDepartment) {
+      const deptPerm = await DepartmentPermissions.findOne({ department: userDepartment });
+      if (deptPerm?.permissions?.allEvents) {
+        hasAllEventsAccess = true;
+      }
+    }
+
+    // Check if user is admin or PGSO
+    if (!hasAllEventsAccess) {
       return res.status(403).json({
         success: false,
-        message: 'Access denied. Admin privileges required.'
+        message: 'Access denied. Admin or PGSO privileges required.'
       });
     }
 
