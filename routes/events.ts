@@ -953,13 +953,26 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     // - Requestor (event owner) can ONLY cancel, and only before approval.
     const user = (req as any).user;
     const userRole = String(user?.role || '').toLowerCase();
-    const userDepartment = String(user?.department || '').trim().toUpperCase();
+    const userDept = String(user?.department || '').trim();
+    const username = String(user?.username || '').trim().toLowerCase();
+    const email = String(user?.email || '').trim().toLowerCase();
     const isAdmin = userRole === 'admin' || userRole === 'superadmin';
-    const isPgso = userDepartment === 'PGSO';
+
+    // Robust PGSO check: matches "event.pgso", "PGSO", "Provincial General Services Office", etc.
+    const isPgso = 
+      username.includes('pgso') ||
+      userDept.toLowerCase().includes('pgso') ||
+      email.includes('pgso');
 
     let hasAllEventsAccess = isAdmin || isPgso;
-    if (!hasAllEventsAccess && userDepartment) {
-      const deptPerm = await DepartmentPermissions.findOne({ department: userDepartment });
+    if (!hasAllEventsAccess && userDept) {
+      const deptPerm = await DepartmentPermissions.findOne({
+        $or: [
+          { department: userDept },
+          { department: { $regex: new RegExp(`^${userDept}$`, 'i') } },
+          { department: { $regex: /pgso/i } }
+        ]
+      });
       if (deptPerm?.permissions?.allEvents) {
         hasAllEventsAccess = true;
       }
@@ -1906,13 +1919,25 @@ router.put('/:id/status', authenticateToken, async (req: Request, res: Response)
     const { status } = req.body;
     const user = (req as any).user;
     const userRole = String(user?.role || '').toLowerCase();
-    const userDepartment = String(user?.department || '').trim().toUpperCase();
+    const userDept = String(user?.department || '').trim();
+    const username = String(user?.username || '').trim().toLowerCase();
+    const email = String(user?.email || '').trim().toLowerCase();
     const isAdmin = userRole === 'admin' || userRole === 'superadmin';
-    const isPgso = userDepartment === 'PGSO';
+
+    const isPgso = 
+      username.includes('pgso') ||
+      userDept.toLowerCase().includes('pgso') ||
+      email.includes('pgso');
 
     let hasAllEventsAccess = isAdmin || isPgso;
-    if (!hasAllEventsAccess && userDepartment) {
-      const deptPerm = await DepartmentPermissions.findOne({ department: userDepartment });
+    if (!hasAllEventsAccess && userDept) {
+      const deptPerm = await DepartmentPermissions.findOne({
+        $or: [
+          { department: userDept },
+          { department: { $regex: new RegExp(`^${userDept}$`, 'i') } },
+          { department: { $regex: /pgso/i } }
+        ]
+      });
       if (deptPerm?.permissions?.allEvents) {
         hasAllEventsAccess = true;
       }
