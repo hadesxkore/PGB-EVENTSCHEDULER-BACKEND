@@ -1,7 +1,7 @@
 # Multi-stage build
 
 # Builder stage — needs devDependencies (TypeScript, ts-node, etc.) to compile
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN npm run build
 # node_modules from builder (which contains heavy devDeps).
 # This alone can cut image size by 50–70%.
 # ─────────────────────────────────────────────────────────────
-FROM node:20-alpine
+FROM node:24-alpine
 
 # Non-root user for security
 RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
