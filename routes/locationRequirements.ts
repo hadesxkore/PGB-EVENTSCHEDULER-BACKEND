@@ -4,6 +4,300 @@ import { authenticateToken } from '../middleware/auth.js';
 
 const router = express.Router();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PAVILION ALLOCATION HELPERS
+// All allocation logic is data-driven from LocationRequirement records.
+// No quantities or location names are hardcoded here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Canonical sub-section names attached to a parent pavilion location.
+ * These must exactly match the locationNames stored in LocationRequirement.
+ * We detect "section" locations by checking if any DB record contains both
+ * the parent name AND one of these tokens in its locationNames array,
+ * OR if a record's locationNames array contains only section-style names.
+ *
+ * We identify Pavilion parent groups dynamically from the DB:
+ *   – A "group" record has locationNames length > 1 (e.g. ["Kagitingan Hall – Section A", ...])
+ *   – OR we look for records whose locationNames contain "Entire" for a known parent.
+ *
+ * The only convention we enforce: the string " – Entire" / "Section A/B/C" suffix
+ * pattern is used to split a compound location into parent + sub.
+ */
+
+/** Separators we accept between base name and sub-location variant. */
+const SUB_SEPARATORS = [' – ', ' - ', ': '];
+
+/**
+ * Split a location string into { base, sub } if it contains a recognised
+ * separator, otherwise return { base: name, sub: '' }.
+ */
+function splitLocationName(name: string): { base: string; sub: string } {
+  for (const sep of SUB_SEPARATORS) {
+    const idx = name.indexOf(sep);
+    if (idx !== -1) {
+      return { base: name.slice(0, idx).trim(), sub: name.slice(idx + sep.length).trim() };
+    }
+  }
+  return { base: name.trim(), sub: '' };
+}
+
+/**
+ * Given a set of selected location strings (e.g. ["Kagitingan Hall – Section A",
+ * "Kagitingan Hall – Section B", "Kalayaan Ballroom – Entire"]) and ALL
+ * LocationRequirement records from the DB, compute the allocated requirements
+ * for each selected location.
+ *
+ * Rules (all data-driven, no hardcoded quantities):
+ *
+ * 1. For each LocationRequirement record whose locationNames array EXACTLY
+ *    matches a set of selected locations (or is a single selected location),
+ *    use its requirements directly.
+ *
+ * 2. For pavilion-style locations that share a common base name and whose
+ *    DB record groups multiple sub-locations together (e.g. the record stores
+ *    combined totals for Section A + B + C), distribute quantities evenly
+ *    among the matching sub-sections that the user actually selected.
+ *
+ * 3. The "Entire" sub-location of a base consolidates without duplicating: it
+ *    receives the full combined total as-is from the DB record (no distribution).
+ *
+ * 4. Any location not found in any DB record gets an empty requirements list.
+ */
+async function computeAllocatedRequirements(
+  selectedLocations: string[]
+): Promise<Record<string, Array<{ name: string; quantity: number; source: string }>>> {
+  // Load all LocationRequirement records once
+  const allRecords = await LocationRequirement.find().lean();
+
+  const result: Record<string, Array<{ name: string; quantity: number; source: string }>> = {};
+
+  // ── Step 1: Group selected locations by their base name ───────────────────
+  const byBase: Record<string, { subs: string[]; full: string[] }> = {};
+  for (const loc of selectedLocations) {
+    const { base, sub } = splitLocationName(loc);
+    if (!byBase[base]) byBase[base] = { subs: [], full: [] };
+    if (sub) byBase[base].subs.push(sub);
+    byBase[base].full.push(loc);
+  }
+
+  // ── Step 2: For each base group, resolve requirements ────────────────────
+  for (const [base, { subs, full }] of Object.entries(byBase)) {
+
+    // ── 2a: Exact-match first ────────────────────────────────────────────────
+    // If there is a record whose locationNames exactly equals the full selected
+    // set for this base, use it verbatim (handles multi-location exact groups).
+    const exactRecord = allRecords.find(r => {
+      const names = [...r.locationNames].sort();
+      const sel   = [...full].sort();
+      return names.length === sel.length && names.every((n, i) => n === sel[i]);
+    });
+
+    if (exactRecord) {
+      for (const loc of full) {
+        result[loc] = exactRecord.requirements.map((req: any) => ({
+          name: req.name,
+          quantity: req.quantity,
+          source: 'exact-match'
+        }));
+      }
+      continue;
+    }
+
+    // ── 2b: Per-location exact-match ──────────────────────────────────────────
+    // Try to find a record that contains ONLY this single location in its
+    // locationNames array.
+    for (const loc of full) {
+      const singleRecord = allRecords.find(r =>
+        r.locationNames.length === 1 && r.locationNames[0] === loc
+      );
+      if (singleRecord) {
+        result[loc] = singleRecord.requirements.map((req: any) => ({
+          name: req.name,
+          quantity: req.quantity,
+          source: 'single-location'
+        }));
+      }
+    }
+
+    // If every location in this base was resolved by single-record match, done.
+    if (full.every(loc => result[loc] !== undefined)) continue;
+
+    // ── 2c: Section-distribution logic ───────────────────────────────────────
+    // Look for a "combined" record that:
+    //   • has locationNames all sharing the same base, OR
+    //   • has locationNames that includes one or more sub-sections of this base.
+    // Then distribute its quantities proportionally among the selected sections.
+
+    const sectionSubs   = subs.filter(s => s.toLowerCase() !== 'entire');
+    const hasEntire     = subs.includes('Entire') || full.some(f => f === base);  // bare base = Entire
+
+    // Find all records related to this base
+    const relatedRecords = allRecords.filter(r =>
+      r.locationNames.some(n => splitLocationName(n).base === base)
+    );
+
+    // Find the combined/group record (the one that holds the totals for sections)
+    // Heuristic: pick the record whose locationNames are all section-style
+    // (i.e. contain sub parts) and whose base names all match.
+    const combinedRecord = relatedRecords.find(r =>
+      r.locationNames.length > 1 &&
+      r.locationNames.every(n => {
+        const { base: b, sub: s } = splitLocationName(n);
+        return b === base && s !== '' && s.toLowerCase() !== 'entire';
+      })
+    );
+
+    // Find the "Entire" record for this base
+    const entireRecord = relatedRecords.find(r =>
+      r.locationNames.length === 1 &&
+      (splitLocationName(r.locationNames[0]).sub.toLowerCase() === 'entire' ||
+       r.locationNames[0] === base)
+    );
+
+    // Find individual per-section records (each has exactly one section location)
+    const perSectionRecords = relatedRecords.filter(r =>
+      r.locationNames.length === 1 &&
+      (() => {
+        const { base: b, sub: s } = splitLocationName(r.locationNames[0]);
+        return b === base && s !== '' && s.toLowerCase() !== 'entire';
+      })()
+    );
+
+    // ── Resolve section sub-locations ─────────────────────────────────────────
+    for (const sub of sectionSubs) {
+      const sectionLoc = full.find(f => splitLocationName(f).sub === sub)!;
+      if (result[sectionLoc] !== undefined) continue; // already resolved
+
+      // Priority 1: a dedicated per-section record
+      const ownRecord = perSectionRecords.find(r => r.locationNames[0] === sectionLoc);
+      if (ownRecord) {
+        result[sectionLoc] = ownRecord.requirements.map((req: any) => ({
+          name: req.name,
+          quantity: req.quantity,
+          source: 'per-section-record'
+        }));
+        continue;
+      }
+
+      // Priority 2: distribute from combined record
+      if (combinedRecord) {
+        // How many section sub-locations does the combined record represent?
+        const totalSections = combinedRecord.locationNames.length;
+
+        result[sectionLoc] = combinedRecord.requirements.map((req: any) => ({
+          name: req.name,
+          // Integer division; remainder stays with the combined total (no loss)
+          quantity: Math.floor(req.quantity / totalSections),
+          source: `distributed-from-combined (÷${totalSections})`
+        }));
+        continue;
+      }
+
+      // Fallback: no record found for this section
+      result[sectionLoc] = [];
+    }
+
+    // ── Resolve "Entire" or bare-base location ────────────────────────────────
+    const entireLocs = full.filter(f => {
+      const { sub } = splitLocationName(f);
+      return sub.toLowerCase() === 'entire' || f === base;
+    });
+
+    for (const entLoc of entireLocs) {
+      if (result[entLoc] !== undefined) continue;
+
+      if (entireRecord) {
+        result[entLoc] = entireRecord.requirements.map((req: any) => ({
+          name: req.name,
+          quantity: req.quantity,
+          source: 'entire-record'
+        }));
+      } else if (combinedRecord) {
+        // Fallback: use combined totals as the "Entire" consolidated view
+        result[entLoc] = combinedRecord.requirements.map((req: any) => ({
+          name: req.name,
+          quantity: req.quantity,
+          source: 'combined-as-entire'
+        }));
+      } else {
+        result[entLoc] = [];
+      }
+    }
+  }
+
+  // ── Step 3: Ensure every selected location has an entry ──────────────────
+  for (const loc of selectedLocations) {
+    if (result[loc] === undefined) result[loc] = [];
+  }
+
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/location-requirements/allocate
+// Called by the frontend "Tag Departments" step (PGSO tagging) on the
+// Request Event page to get allocated logistics per selected location(s).
+//
+// Body: { locations: string[] }
+// Response: { allocations: Record<location, Requirement[]>, summary: {...} }
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/allocate', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { locations } = req.body;
+
+    if (!locations || !Array.isArray(locations) || locations.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'locations array is required and must not be empty'
+      });
+    }
+
+    const uniqueLocations: string[] = [...new Set(
+      locations.map((l: any) => String(l).trim()).filter(Boolean)
+    )];
+
+    if (uniqueLocations.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid location names provided'
+      });
+    }
+
+    const rawAllocations = await computeAllocatedRequirements(uniqueLocations);
+
+    // Strip internal source metadata before sending to client
+    const allocations: Record<string, Array<{ name: string; quantity: number }>> = {};
+    const summary: Array<{ location: string; requirementCount: number; items: Array<{ name: string; quantity: number }> }> = [];
+
+    for (const loc of uniqueLocations) {
+      const items = (rawAllocations[loc] || []).map(r => ({
+        name: r.name,
+        quantity: r.quantity
+      }));
+      allocations[loc] = items;
+      summary.push({ location: loc, requirementCount: items.length, items });
+    }
+
+    console.log(`📦 [ALLOCATE] Resolved requirements for ${uniqueLocations.length} location(s):`,
+      summary.map(s => `${s.location} → ${s.requirementCount} items`).join(', ')
+    );
+
+    return res.status(200).json({
+      success: true,
+      allocations,
+      summary
+    });
+  } catch (error) {
+    console.error('Error computing location allocations:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Error computing location allocations',
+      error: (error as Error).message
+    });
+  }
+});
+
 // Drop old index and migrate (run once after deleting old data)
 router.post('/fix-index', authenticateToken, async (req: Request, res: Response) => {
   try {

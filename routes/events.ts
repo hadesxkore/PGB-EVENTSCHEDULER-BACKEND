@@ -317,7 +317,7 @@ const upload = multer({
   }
 });
 
-// PATCH /api/events/:eventId/requirements/:requirementId/notes - Update requirement notes
+// PATCH /api/events/:eventId/requirements/:requirementId/notes - Update requirement notes (department side)
 router.patch('/:eventId/requirements/:requirementId/notes', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { eventId, requirementId } = req.params;
@@ -366,11 +366,6 @@ router.patch('/:eventId/requirements/:requirementId/notes', authenticateToken, a
     // Save the updated event
     await event.save();
 
-    // Debug: Log the saved requirement to verify departmentNotes is saved
-    const savedRequirement = Object.values(event.departmentRequirements)
-      .flat()
-      .find(r => r.id === requirementId);
-
     res.status(200).json({
       success: true,
       message: 'Requirement notes updated successfully',
@@ -380,6 +375,131 @@ router.patch('/:eventId/requirements/:requirementId/notes', authenticateToken, a
     res.status(500).json({
       success: false,
       message: 'Failed to update requirement notes',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/events/:eventId/requirements/:requirementId/edit
+// Event OWNER edits quantity and/or requestor-side notes on any requirement,
+// regardless of that requirement's current approval status.
+// - Does NOT change the requirement's status (approved stays approved, etc.)
+// - Does NOT allow users to edit other people's events
+// - Emits real-time socket update so department views refresh instantly
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch('/:eventId/requirements/:requirementId/edit', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { eventId, requirementId } = req.params;
+    const { quantity, notes } = req.body;
+    const userId = (req as any).user?._id;
+
+    // Validate: at least one editable field must be present
+    if (quantity === undefined && notes === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'Provide at least one of: quantity, notes'
+      });
+    }
+
+    if (quantity !== undefined) {
+      const qty = Number(quantity);
+      if (!Number.isFinite(qty) || qty < 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'quantity must be a non-negative number'
+        });
+      }
+    }
+
+    // Find the event
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({
+        success: false,
+        message: 'Event not found'
+      });
+    }
+
+    // Authorization: only the event owner may edit quantities/notes
+    if (!userId || event.createdBy.toString() !== userId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the event owner can edit requirement quantities and notes'
+      });
+    }
+
+    // Find the requirement across all departments
+    let requirementFound = false;
+    let foundDept = '';
+    let updatedReq: any = null;
+
+    for (const [dept, requirements] of Object.entries(event.departmentRequirements) as [string, any[]][]) {
+      const requirement: any = requirements.find(r => r.id === requirementId);
+      if (requirement) {
+        // Apply edits — preserve everything else including status
+        if (quantity !== undefined) requirement.quantity = Number(quantity);
+        if (notes !== undefined) requirement.notes = String(notes);
+        requirement.lastUpdated = new Date().toISOString();
+
+        foundDept = dept;
+        updatedReq = requirement;
+        requirementFound = true;
+        break;
+      }
+    }
+
+    if (!requirementFound) {
+      return res.status(404).json({
+        success: false,
+        message: 'Requirement not found'
+      });
+    }
+
+    event.markModified('departmentRequirements');
+    await event.save();
+
+    // Real-time update — notify department and event owner so both UIs refresh
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        const updatePayload = {
+          type: 'requirement-edited',
+          notificationType: 'requirement-edited',
+          eventId: (event._id as any).toString(),
+          eventTitle: event.eventTitle,
+          requirementId,
+          departmentName: foundDept,
+          updatedFields: {
+            quantity: updatedReq?.quantity,
+            notes: updatedReq?.notes
+          },
+          updatedEvent: event,
+          timestamp: Date.now()
+        };
+
+        // Notify the department that owns this requirement
+        io.emit('requirement-edited', updatePayload);
+
+        // Notify the event creator (may be a different user viewing the event)
+        io.to(`user-${event.createdBy}`).emit('requirement-edited', updatePayload);
+
+        // Also notify editing user themselves for optimistic UI sync
+        io.to(`user-${userId}`).emit('requirement-edited', updatePayload);
+      }
+    } catch (_socketErr) {
+      // Non-critical — don't fail the HTTP response
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Requirement updated successfully',
+      data: event
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update requirement',
       error: error instanceof Error ? error.message : 'Unknown error'
     });
   }
@@ -607,7 +727,7 @@ router.patch('/:eventId/requirements/:requirementId/status', authenticateToken, 
     let oldStatus = '';
     let requirementName = '';
     let updatedRequirement: any = null;
-    
+
     for (const [dept, requirements] of Object.entries(event.departmentRequirements) as [string, any[]][]) {
       const requirement = requirements.find(r => r.id === requirementId);
       if (requirement) {
@@ -615,12 +735,12 @@ router.patch('/:eventId/requirements/:requirementId/status', authenticateToken, 
         requirementName = requirement.name || 'Unknown Requirement';
         requirement.status = status;
         requirement.lastUpdated = new Date().toISOString();
-        
+
         // Save decline reason if status is declined
         if (status === 'declined' && declineReason) {
           requirement.declineReason = declineReason;
         }
-        
+
         updatedRequirement = requirement;
         requirementFound = true;
         break;
@@ -657,7 +777,7 @@ router.patch('/:eventId/requirements/:requirementId/status', authenticateToken, 
           type: 'status_update',
           notificationType: 'status_update'
         };
-        
+
         // Send to event creator
         io.to(`user-${event.createdBy}`).emit('status-update', statusUpdateData);
         io.to(`user-${event.createdBy}`).emit('new-notification', {
@@ -665,14 +785,14 @@ router.patch('/:eventId/requirements/:requirementId/status', authenticateToken, 
           eventTitle: event.eventTitle,
           message: `${requirementName} status changed to "${status}" by ${userDepartment}`
         });
-        
+
         // ALSO send to the user who made the update (for their own badge update!)
         const updatingUserId = (req as any).user.id;
         if (updatingUserId && updatingUserId.toString() !== event.createdBy.toString()) {
           io.to(`user-${updatingUserId}`).emit('status-update', statusUpdateData);
         }
       }
-      
+
       // Then try to create notifications (non-critical)
       try {
         // Create notification in main notifications collection with unique ID
@@ -736,7 +856,7 @@ router.patch('/:eventId/requirements/:requirementId/departments', authenticateTo
   try {
     const { eventId, requirementId } = req.params;
     const { departments } = req.body;
-    
+
     if (!Array.isArray(departments) || departments.length === 0) {
       return res.status(400).json({
         success: false,
@@ -756,7 +876,7 @@ router.patch('/:eventId/requirements/:requirementId/departments', authenticateTo
     // Find the requirement in current departments
     let requirement: any = null;
     let oldDepartment: string = '';
-    
+
     for (const [dept, requirements] of Object.entries(event.departmentRequirements) as [string, any[]][]) {
       const foundReq = requirements.find(r => r.id === requirementId);
       if (foundReq) {
@@ -833,87 +953,210 @@ router.patch('/:eventId/requirements/:requirementId/departments', authenticateTo
   }
 });
 
-// POST /api/events/:eventId/add-department - Add department with requirements to existing event
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/events/:eventId/available-departments
+// Returns all visible departments that have NOT yet been tagged on this event.
+// Used by BOTH:
+//   • Request Event Step 3 (Tag Departments) — to show selectable departments
+//   • My Events "Add More Departments" — same list, same logic
+// This guarantees both UIs share the exact same department data source.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/:eventId/available-departments', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { eventId } = req.params;
+
+    // Find the event (or use an empty taggedDepartments list for a new event)
+    let taggedDepartments: string[] = [];
+    if (eventId && eventId !== 'new') {
+      const event = await Event.findById(eventId).select('taggedDepartments').lean();
+      if (event) taggedDepartments = event.taggedDepartments || [];
+    }
+
+    // Fetch all visible departments from the shared Department collection
+    const allDepartments = await Department.find({ isVisible: true })
+      .select('_id name requirements isVisible')
+      .sort({ name: 1 })
+      .lean();
+
+    // Split into already-tagged and available
+    const available = allDepartments.filter(d => !taggedDepartments.includes(d.name));
+    const alreadyTagged = allDepartments.filter(d => taggedDepartments.includes(d.name));
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        available,
+        alreadyTagged,
+        taggedDepartments
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch available departments',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/events/:eventId/add-department
+// Add a department (with its requirements) to an existing event.
+// Used by BOTH My Events "Add More Departments" AND the event creation flow.
+//
+// Key guarantees:
+//   • Only the event owner can call this (authorization check)
+//   • Prevents duplicate tagging of the same department
+//   • Does NOT overwrite existing department requirements/approvals
+//   • Automatically sets requirementsStatus = 'released' when event is approved
+//     so the newly added department can immediately see and act on its requirements
+//   • Emits real-time socket events so both My Events and tagged department
+//     views update instantly without a page refresh
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/:eventId/add-department', authenticateToken, async (req: Request, res: Response) => {
   try {
     const { eventId } = req.params;
     const { departmentName, requirements } = req.body;
+    const userId = (req as any).user?._id;
 
-    if (!departmentName || !Array.isArray(requirements) || requirements.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Department name and requirements array are required'
-      });
-    }
-
-    // Find the event
-    const event = await Event.findById(eventId);
-    if (!event) {
-      return res.status(404).json({
-        success: false,
-        message: 'Event not found'
-      });
-    }
-
-    // Initialize departmentRequirements if it doesn't exist
-    if (!event.departmentRequirements) {
-      event.departmentRequirements = {};
-    }
-
-    // Add or update requirements for this department
-    if (!event.departmentRequirements[departmentName]) {
-      event.departmentRequirements[departmentName] = [];
-    }
-
-    // Add new requirements (filter out duplicates by name)
-    requirements.forEach((newReq: any) => {
-      if (newReq.selected) {
-        const existingReq = event.departmentRequirements[departmentName].find(
-          (r: any) => r.name === newReq.name
-        );
-        
-        if (!existingReq) {
-          // Add new requirement with availability info
-          event.departmentRequirements[departmentName].push({
-            id: newReq.id,
-            name: newReq.name,
-            type: newReq.type,
-            selected: true,
-            quantity: newReq.quantity || undefined,
-            notes: newReq.notes || '',
-            totalQuantity: newReq.totalQuantity || newReq.baseQuantity || undefined,
-            isAvailable: newReq.isAvailable,
-            availabilityNotes: newReq.availabilityNotes || '',
-            status: 'pending'
-          });
-        }
+      if (!departmentName || typeof departmentName !== 'string' || !departmentName.trim()) {
+        return res.status(400).json({
+          success: false,
+        message: 'departmentName is required'
+        });
       }
-    });
 
-    // Update tagged departments list
-    if (!event.taggedDepartments.includes(departmentName)) {
-      event.taggedDepartments.push(departmentName);
-    }
+      if (!Array.isArray(requirements)) {
+        return res.status(400).json({
+          success: false,
+          message: 'requirements must be an array'
+        });
+      }
 
-    // Mark as modified for Mongoose
-    event.markModified('departmentRequirements');
-    event.markModified('taggedDepartments');
+      // Find the event
+      const event = await Event.findById(eventId);
+      if (!event) {
+        return res.status(404).json({
+          success: false,
+          message: 'Event not found'
+        });
+      }
 
-    // Save the event
-    await event.save();
+      // Authorization: only the event owner may add departments
+      if (!userId || event.createdBy.toString() !== userId.toString()) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only the event owner can add departments to this event'
+        });
+      }
 
-    res.status(200).json({
-      success: true,
-      message: 'Department added successfully',
-      data: event
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to add department',
-      error: error instanceof Error ? error.message : 'Unknown error'
-    });
-  }
+      // Prevent duplicate department tagging
+      if (event.taggedDepartments.includes(departmentName.trim())) {
+        return res.status(409).json({
+          success: false,
+          message: `Department "${departmentName}" is already tagged on this event`
+        });
+      }
+
+      // Verify the department actually exists and is visible
+      const deptRecord = await Department.findOne({
+        name: departmentName.trim().toUpperCase()
+      }).lean();
+
+      // Initialize departmentRequirements map if needed
+      if (!event.departmentRequirements) {
+        event.departmentRequirements = {};
+      }
+
+        const deptKey = departmentName.trim();
+
+        // Guard: do not overwrite existing requirements for this department
+        if (!event.departmentRequirements[deptKey]) {
+          event.departmentRequirements[deptKey] = [];
+        }
+
+            // Determine requirementsStatus based on current event status.
+            // If the event is already approved, the new department's requirements
+            // must be immediately released so they can respond.
+            const eventIsApproved = String(event.status || '').toLowerCase() === 'approved';
+            const requirementsStatus = eventIsApproved ? 'released' : 'on-hold';
+
+            // Build requirement entries — only add selected ones, skip duplicates by name
+            const selectedRequirements = requirements.filter((r: any) => r.selected !== false);
+            for (const newReq of selectedRequirements) {
+              const alreadyExists = event.departmentRequirements[deptKey].find(
+                (r: any) => r.name === newReq.name
+              );
+              if (!alreadyExists) {
+                event.departmentRequirements[deptKey].push({
+                  id: newReq.id || `${deptKey}-${newReq.name}-${Date.now()}`,
+                  name: newReq.name,
+                  type: newReq.type || 'physical',
+                  selected: true,
+                  quantity: newReq.quantity !== undefined ? newReq.quantity : undefined,
+                  notes: newReq.notes || '',
+                  totalQuantity: newReq.totalQuantity || newReq.baseQuantity || undefined,
+                  isAvailable: newReq.isAvailable !== undefined ? newReq.isAvailable : true,
+                  availabilityNotes: newReq.availabilityNotes || '',
+                  status: 'pending',
+                  requirementsStatus,
+                  lastUpdated: new Date().toISOString()
+                });
+              }
+      }
+
+        // Tag the department
+        if (!event.taggedDepartments.includes(deptKey)) {
+          event.taggedDepartments.push(deptKey);
+        }
+
+        event.markModified('departmentRequirements');
+        event.markModified('taggedDepartments');
+        await event.save();
+
+          // Real-time updates
+          try {
+            const io = req.app.get('io');
+            if(io) {
+              const updatePayload = {
+                type: 'department-added',
+                notificationType: 'department-added',
+                eventId: (event._id as any).toString(),
+                eventTitle: event.eventTitle,
+                departmentName: deptKey,
+                requirementsStatus,
+                updatedEvent: event,
+                timestamp: Date.now()
+              };
+
+              // Broadcast globally (admins, event owner, and newly tagged department)
+              io.emit('department-added', updatePayload);
+
+              // Direct notification to event owner
+              io.to(`user-${event.createdBy}`).emit('department-added', updatePayload);
+
+              // Notify users in the newly added department so they see the event
+              io.emit('new-notification', {
+                ...updatePayload,
+                message: `Your department has been added to event "${event.eventTitle}"`
+              });
+            }
+          } catch(_socketErr) {
+            // Non-critical
+          }
+
+    return res.status(200).json({
+            success: true,
+            message: `Department "${deptKey}" added successfully`,
+            data: event
+          });
+        } catch (error) {
+            return res.status(500).json({
+              success: false,
+              message: 'Failed to add department',
+              error: error instanceof Error ? error.message : 'Unknown error'
+            });
+          }
 });
 
 // PATCH /api/events/:id/status - Update event status (Admin only - Approve/Reject)
@@ -921,7 +1164,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
   try {
     const { id } = req.params;
     const { status, reason } = req.body;
-    
+
     // Validate status
     if (!['approved', 'rejected', 'submitted', 'cancelled'].includes(status)) {
       return res.status(400).json({
@@ -929,18 +1172,18 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         message: 'Invalid status. Must be approved, rejected, submitted, or cancelled'
       });
     }
-    
+
     // Prepare update object
     const updateData: any = { status };
-    
+
     // Add reason if provided (for rejected or cancelled status)
     if (reason && (status === 'rejected' || status === 'cancelled')) {
       updateData.reason = reason;
     }
-    
+
     // Find the event first to check if it's being cancelled
     const event = await Event.findById(id);
-    
+
     if (!event) {
       return res.status(404).json({
         success: false,
@@ -959,7 +1202,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     const isAdmin = userRole === 'admin' || userRole === 'superadmin';
 
     // Robust PGSO check: matches "event.pgso", "PGSO", "Provincial General Services Office", etc.
-    const isPgso = 
+    const isPgso =
       username.includes('pgso') ||
       userDept.toLowerCase().includes('pgso') ||
       email.includes('pgso');
@@ -1018,12 +1261,12 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         }
       }
     }
-    
+
     // If approving the event, RELEASE requirements to departments
     if (status === 'approved') {
       // Release all department requirements (change from on-hold to released)
       const departmentRequirements = event.departmentRequirements || {};
-      
+
       for (const department in departmentRequirements) {
         const requirements = departmentRequirements[department];
         if (Array.isArray(requirements)) {
@@ -1032,15 +1275,15 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
           });
         }
       }
-      
+
       updateData.departmentRequirements = departmentRequirements;
     }
-    
+
     // If cancelling the event, reset all department requirements
     if (status === 'cancelled') {
       // Reset all department requirements to pending
       const departmentRequirements = event.departmentRequirements || {};
-      
+
       for (const department in departmentRequirements) {
         const requirements = departmentRequirements[department];
         if (Array.isArray(requirements)) {
@@ -1051,7 +1294,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
           });
         }
       }
-      
+
       updateData.departmentRequirements = departmentRequirements;
 
       // If requestor cancelled and no reason provided, use a default
@@ -1068,7 +1311,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
       };
       updateData.cancelledAt = new Date();
     }
-    
+
     // Update the event
     const updatedEvent = await Event.findByIdAndUpdate(
       id,
@@ -1125,7 +1368,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
     } catch (persistError) {
       // Non-critical
     }
-    
+
     // Emit Socket.IO event for real-time updates
     const io = req.app.get('io');
     if (io) {
@@ -1150,7 +1393,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         const eDateStr = eDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: tz });
         return `${sDateStr} ${startT} - ${eDateStr} ${endT}`;
       };
-      
+
       // Notify the event creator with new-notification event (for GlobalNotificationSystem)
       io.to(`user-${event.createdBy}`).emit('new-notification', {
         type: 'event_status_update',
@@ -1178,7 +1421,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         ),
         timestamp: Date.now()
       });
-      
+
       // Also emit old event for backward compatibility
       io.to(`user-${event.createdBy}`).emit('event-status-updated', {
         eventId: event._id,
@@ -1186,10 +1429,10 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         status: status,
         message: `Your event "${event.eventTitle}" has been ${status}`
       });
-      
+
       // Broadcast to all admins
       io.emit('event-updated', updatedEvent);
-      
+
       // If approved, notify all tagged departments that requirements are now released
       if (status === 'approved' && updatedEvent!.taggedDepartments) {
         // Emit to all users (for real-time dashboard updates)
@@ -1201,7 +1444,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
           message: `Event "${updatedEvent!.eventTitle}" has been approved`,
           timestamp: Date.now()
         });
-        
+
         // Also emit status-update for backward compatibility
         updatedEvent!.taggedDepartments.forEach((dept: string) => {
           io.emit('status-update', {
@@ -1213,7 +1456,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
           });
         });
       }
-      
+
       // If cancelled, notify all tagged departments about requirement reset
       if (status === 'cancelled' && updatedEvent!.taggedDepartments) {
         updatedEvent!.taggedDepartments.forEach((dept: string) => {
@@ -1226,7 +1469,7 @@ router.patch('/:id/status', authenticateToken, async (req: Request, res: Respons
         });
       }
     }
-    
+
     res.status(200).json({
       success: true,
       message: `Event ${status} successfully`,
@@ -1252,17 +1495,17 @@ router.patch('/:id/details', authenticateToken, upload.fields([
     const { id } = req.params;
     const { eventTitle, requestor, participants, vip, vvip, contactNumber, contactEmail, description } = req.body;
     const files = req.files as { [fieldname: string]: Express.Multer.File[] };
-    
+
     // Find the event
     const event = await Event.findById(id);
-    
+
     if (!event) {
       return res.status(404).json({
         success: false,
         message: 'Event not found'
       });
     }
-    
+
     // Check if user owns this event
     const userId = (req as any).user._id;
     if (event.createdBy.toString() !== userId.toString()) {
@@ -1271,7 +1514,7 @@ router.patch('/:id/details', authenticateToken, upload.fields([
         message: 'You can only edit your own events'
       });
     }
-    
+
     // Allow editing if event is submitted or approved (but not completed/cancelled/rejected)
     if (event.status !== 'submitted' && event.status !== 'approved') {
       return res.status(400).json({
@@ -1279,7 +1522,7 @@ router.patch('/:id/details', authenticateToken, upload.fields([
         message: 'You can only edit details of submitted or approved events'
       });
     }
-    
+
     // Validate required fields
     if (!eventTitle || !requestor || !contactEmail || !contactNumber) {
       return res.status(400).json({
@@ -1287,14 +1530,14 @@ router.patch('/:id/details', authenticateToken, upload.fields([
         message: 'Event title, requestor, contact email, and contact number are required'
       });
     }
-    
+
     if (participants < 1) {
       return res.status(400).json({
         success: false,
         message: 'Participants must be at least 1'
       });
     }
-    
+
     // Update the event details
     const updateData: any = {
       eventTitle,
@@ -1303,12 +1546,12 @@ router.patch('/:id/details', authenticateToken, upload.fields([
       contactNumber,
       contactEmail
     };
-    
+
     // Optional fields
     if (vip !== undefined) updateData.vip = parseInt(vip);
     if (vvip !== undefined) updateData.vvip = parseInt(vvip);
     if (description !== undefined) updateData.description = description;
-    
+
     // Handle file uploads - APPEND to existing files
     if (files) {
       // Add new attachments to existing ones
@@ -1319,16 +1562,16 @@ router.patch('/:id/details', authenticateToken, upload.fields([
           mimetype: file.mimetype,
           size: file.size
         }));
-        
+
         // Append to existing attachments
         updateData.attachments = [...(event.attachments || []), ...newAttachments];
       }
-      
+
       // Handle government files - update or add
       if (!updateData.govFiles) {
         updateData.govFiles = event.govFiles || {};
       }
-      
+
       if (files.brieferTemplate && files.brieferTemplate[0]) {
         updateData.govFiles.brieferTemplate = {
           filename: files.brieferTemplate[0].filename,
@@ -1337,7 +1580,7 @@ router.patch('/:id/details', authenticateToken, upload.fields([
           size: files.brieferTemplate[0].size
         };
       }
-      
+
       if (files.availableForDL && files.availableForDL[0]) {
         updateData.govFiles.availableForDL = {
           filename: files.availableForDL[0].filename,
@@ -1346,7 +1589,7 @@ router.patch('/:id/details', authenticateToken, upload.fields([
           size: files.availableForDL[0].size
         };
       }
-      
+
       if (files.programme && files.programme[0]) {
         updateData.govFiles.programme = {
           filename: files.programme[0].filename,
@@ -1356,13 +1599,13 @@ router.patch('/:id/details', authenticateToken, upload.fields([
         };
       }
     }
-    
+
     const updatedEvent = await Event.findByIdAndUpdate(
       id,
       updateData,
       { new: true, runValidators: true }
     ).populate('createdBy', 'name email department');
-    
+
     // Emit Socket.IO event to notify the user
     const io = (req as any).io;
     if (io) {
@@ -1372,13 +1615,13 @@ router.patch('/:id/details', authenticateToken, upload.fields([
         message: `Event details updated successfully`
       });
     }
-    
+
     res.json({
       success: true,
       message: 'Event details updated successfully',
       data: updatedEvent
     });
-    
+
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -1404,24 +1647,24 @@ router.get('/tagged', authenticateToken, async (req: Request, res: Response) => 
       taggedDepartments: userDepartment,
       status: { $in: ['approved', 'completed', 'cancelled'] } // Include cancelled so departments see cancelled tagged events
     })
-    .populate('createdBy', 'name email department')
-    .sort({ 
-      status: 1, // Approved (0) comes before completed (1) alphabetically
-      startDate: 1 // Then sort by start date (earliest first)
-    })
-    .lean(); // Bypass Mongoose cache and get fresh data from MongoDB
+      .populate('createdBy', 'name email department')
+      .sort({
+        status: 1, // Approved (0) comes before completed (1) alphabetically
+        startDate: 1 // Then sort by start date (earliest first)
+      })
+      .lean(); // Bypass Mongoose cache and get fresh data from MongoDB
 
     // Recalculate availability for each event based on current startDate
     const eventsWithUpdatedAvailability = await Promise.all(events.map(async (event: any) => {
       const eventDate = new Date(event.startDate).toISOString().split('T')[0]; // Format: YYYY-MM-DD
-      
+
       // Get department requirements for this event
       const departmentRequirements = event.departmentRequirements || {};
-      
+
       // Update availability for ALL departments (not just user's department)
       for (const deptName in departmentRequirements) {
         const requirements = departmentRequirements[deptName];
-        
+
         const updatedRequirements = await Promise.all(
           requirements.map(async (req: any) => {
             // Find the department to get the requirement details
@@ -1429,36 +1672,36 @@ router.get('/tagged', authenticateToken, async (req: Request, res: Response) => 
             if (!department) {
               return req;
             }
-            
+
             // Find the requirement in the department
             const deptReq = department.requirements.find((r: any) => r.text === req.name);
             if (!deptReq) {
               return req;
             }
-            
+
             // Check if there's a custom availability for this date
             const availability = await ResourceAvailability.findOne({
               departmentId: department._id,
               requirementId: deptReq._id,
               date: eventDate
             });
-            
+
             const oldQuantity = req.totalQuantity;
-            
+
             // Update totalQuantity based on availability or default
             if (availability) {
               req.totalQuantity = availability.quantity;
             } else if (deptReq.totalQuantity) {
               req.totalQuantity = deptReq.totalQuantity;
             }
-            
+
             return req;
           })
         );
-        
+
         departmentRequirements[deptName] = updatedRequirements;
       }
-      
+
       return {
         ...event,
         departmentRequirements
@@ -1529,14 +1772,14 @@ router.get('/my', authenticateToken, async (req: Request, res: Response) => {
       const eventDate = new Date(event.startDate).toISOString().split('T')[0]; // Format: YYYY-MM-DD
       // Disabled verbose logging
       // console.log(`🔄 [MY EVENTS] Recalculating availability for: ${event.eventTitle}, Date: ${eventDate}`);
-      
+
       // Get department requirements for this event
       const departmentRequirements = event.departmentRequirements || {};
-      
+
       // Update availability for ALL departments
       for (const deptName in departmentRequirements) {
         const requirements = departmentRequirements[deptName];
-        
+
         const updatedRequirements = await Promise.all(
           requirements.map(async (req: any) => {
             // Find the department to get the requirement details
@@ -1546,22 +1789,22 @@ router.get('/my', authenticateToken, async (req: Request, res: Response) => {
               // console.log(`⚠️ [MY EVENTS] Department not found: ${deptName}`);
               return req;
             }
-            
+
             // Find the requirement in the department
             const deptReq = department.requirements.find((r: any) => r.text === req.name);
             if (!deptReq) {
               return req;
             }
-            
+
             // Check if there's a custom availability for this date
             const availability = await ResourceAvailability.findOne({
               departmentId: department._id,
               requirementId: deptReq._id,
               date: eventDate
             });
-            
+
             const oldQuantity = req.totalQuantity;
-            
+
             // Update totalQuantity based on availability or default
             if (availability) {
               req.totalQuantity = availability.quantity;
@@ -1572,14 +1815,14 @@ router.get('/my', authenticateToken, async (req: Request, res: Response) => {
               // Disabled verbose logging
               // console.log(`📋 [MY EVENTS] ${deptName} - ${req.name}: Using default ${deptReq.totalQuantity} (no custom for ${eventDate})`);
             }
-            
+
             return req;
           })
         );
-        
+
         departmentRequirements[deptName] = updatedRequirements;
       }
-      
+
       return {
         ...event,
         departmentRequirements
@@ -1636,7 +1879,7 @@ router.post('/', authenticateToken, upload.fields([
   try {
     const userId = (req as any).user._id;
     const files = req.files as { [fieldname: string]: Express.Multer.File[] };
-    
+
     // Parse form data
     const {
       eventTitle,
@@ -1731,7 +1974,7 @@ router.post('/', authenticateToken, upload.fields([
     let govFiles: any = undefined;
     if (withoutGov === 'true') {
       govFiles = {};
-      
+
       if (files.brieferTemplate) {
         const file = files.brieferTemplate[0];
         govFiles.brieferTemplate = {
@@ -1742,7 +1985,7 @@ router.post('/', authenticateToken, upload.fields([
           uploadedAt: new Date()
         };
       }
-      
+
       if (files.availableForDL) {
         const file = files.availableForDL[0];
         govFiles.availableForDL = {
@@ -1753,7 +1996,7 @@ router.post('/', authenticateToken, upload.fields([
           uploadedAt: new Date()
         };
       }
-      
+
       if (files.programme) {
         const file = files.programme[0];
         govFiles.programme = {
@@ -1809,19 +2052,19 @@ router.post('/', authenticateToken, upload.fields([
       'Gymnasium', 'Lobby', 'Open Court', 'Oval', 'Parking Area',
       'Quadrangle', 'Rooftop'
     ];
-    
+
     if (location && !predefinedLocations.includes(location)) {
-      
+
       try {
         const eventDate = new Date(startDate).toISOString().split('T')[0];
         const userDepartment = (req as any).user.department || 'Unknown';
-        
+
         // Check if availability already exists for this location and date
         const existingAvailability = await LocationAvailability.findOne({
           date: eventDate,
           locationName: location
         });
-        
+
         if (!existingAvailability) {
           const newLocation = await LocationAvailability.create({
             date: eventDate,
@@ -1848,10 +2091,10 @@ router.post('/', authenticateToken, upload.fields([
         status: eventData.status,
         connectedClients: io.engine.clientsCount
       });
-      
+
       // Broadcast to all connected clients using multiple methods to ensure delivery
       io.emit('event-created', eventData);
-      
+
       // Also emit to all sockets in the default namespace
       io.of('/').emit('event-created', eventData);
 
@@ -1892,7 +2135,7 @@ router.post('/', authenticateToken, upload.fields([
           console.error('❌ Failed to emit BAC location notification:', e);
         }
       }
-      
+
       console.log('✅ Socket.IO event-created emitted successfully for event:', savedEvent.eventTitle);
     } else {
       console.error('❌ Socket.IO instance not found in app');
@@ -1924,7 +2167,7 @@ router.put('/:id/status', authenticateToken, async (req: Request, res: Response)
     const email = String(user?.email || '').trim().toLowerCase();
     const isAdmin = userRole === 'admin' || userRole === 'superadmin';
 
-    const isPgso = 
+    const isPgso =
       username.includes('pgso') ||
       userDept.toLowerCase().includes('pgso') ||
       email.includes('pgso');
@@ -2033,7 +2276,7 @@ router.get('/attachment/:filename', (req: Request, res: Response) => {
     const { download } = req.query;
     const downloadFlag = Array.isArray(download) ? download[0] : download;
     const filePath = path.join(process.cwd(), 'uploads', 'events', String(filename));
-    
+
     // Check if file exists
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({
@@ -2042,12 +2285,12 @@ router.get('/attachment/:filename', (req: Request, res: Response) => {
         requestedPath: filePath
       });
     }
-    
+
     // If download=true, force download with Content-Disposition header
     if (downloadFlag === 'true') {
       res.setHeader('Content-Disposition', `attachment; filename="${String(filename)}"`);
     }
-    
+
     // Serve the file
     res.sendFile(filePath);
   } catch (error) {
@@ -2126,7 +2369,7 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
       (endTime !== undefined && endTime !== event.endTime) ||
       slotsChanged
     );
-    
+
     const parseDateOnly = (value: any): Date | null => {
       if (typeof value !== 'string') return null;
       if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
@@ -2147,9 +2390,9 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
     const updateData: any = {
       updatedAt: new Date()
     };
-    
+
     console.log('[PUT /:id] received body - location:', location, '| locations:', locations, '| locationsArray:', locationsArray, '| multipleLocations:', multipleLocations);
-    
+
     if (location !== undefined) updateData.location = location;
     if (locationsArray !== undefined) updateData.locations = locationsArray;
     if (multipleLocations !== undefined) updateData.multipleLocations = multipleLocations;
@@ -2281,7 +2524,7 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
         // Don't fail the request if notification fails
       }
     }
-    
+
     // 📍 AUTO-CREATE LOCATION AVAILABILITY FOR CUSTOM LOCATIONS (on update)
     if (location !== undefined && updatedEvent) {
       const predefinedLocations = [
@@ -2289,18 +2532,18 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
         'Gymnasium', 'Lobby', 'Open Court', 'Oval', 'Parking Area',
         'Quadrangle', 'Rooftop'
       ];
-      
+
       if (!predefinedLocations.includes(location)) {
         try {
           const eventDate = new Date(updatedEvent.startDate).toISOString().split('T')[0];
           const userDepartment = (req as any).user.department || 'Unknown';
-          
+
           // Check if availability already exists for this location and date
           const existingAvailability = await LocationAvailability.findOne({
             date: eventDate,
             locationName: location
           });
-          
+
           if (!existingAvailability) {
             await LocationAvailability.create({
               date: eventDate,
@@ -2317,12 +2560,12 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
         }
       }
     }
-    
+
     // Create activity log if this is a reschedule
     if (isReschedule && updatedEvent) {
       try {
         const user = (req as any).user;
-        
+
         // Format dates nicely (e.g., "Oct 23, 2025 8:00 AM")
         const formatDateTime = (date: Date, time: string) => {
           const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -2332,15 +2575,15 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
           const displayHour = hour % 12 || 12;
           return `${dateStr} ${displayHour}:${minutes} ${ampm}`;
         };
-        
+
         const oldStartFormatted = formatDateTime(event.startDate!, event.startTime);
         const oldEndFormatted = formatDateTime(event.endDate!, event.endTime);
         const newStartFormatted = formatDateTime(updatedEvent.startDate!, updatedEvent.startTime);
         const newEndFormatted = formatDateTime(updatedEvent.endDate!, updatedEvent.endTime);
-        
+
         const oldSchedule = `${oldStartFormatted} - ${oldEndFormatted}`;
         const newSchedule = `${newStartFormatted} - ${newEndFormatted}`;
-        
+
         // Determine what changed
         const locationChanged = location !== undefined && location !== event.location;
         const dateTimeChanged = (
@@ -2349,7 +2592,7 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
           (endDate !== undefined && endDate !== event.endDate?.toISOString().split('T')[0]) ||
           (endTime !== undefined && endTime !== event.endTime)
         );
-        
+
         let description = '';
         if (locationChanged && dateTimeChanged) {
           description = `Rescheduled event "${event.eventTitle}" from ${oldSchedule} at ${event.location} to ${newSchedule} at ${updatedEvent.location}`;
@@ -2358,7 +2601,7 @@ router.put('/:id', authenticateToken, async (req: Request, res: Response) => {
         } else {
           description = `Rescheduled event "${event.eventTitle}" from ${oldSchedule} to ${newSchedule}`;
         }
-        
+
         await UserActivityLog.create({
           userId: user._id,
           username: event.requestor, // Use event's requestor name, not logged-in user
@@ -2465,7 +2708,7 @@ router.get('/govfile/:filename', (req: Request, res: Response) => {
     const { download } = req.query;
     const downloadFlag = Array.isArray(download) ? download[0] : download;
     const filePath = path.join(process.cwd(), 'uploads', 'events', String(filename));
-    
+
     // Check if file exists
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({
@@ -2474,12 +2717,12 @@ router.get('/govfile/:filename', (req: Request, res: Response) => {
         requestedPath: filePath
       });
     }
-    
+
     // If download=true, force download with Content-Disposition header
     if (downloadFlag === 'true') {
       res.setHeader('Content-Disposition', `attachment; filename="${String(filename)}"`);
     }
-    
+
     // Serve the file
     res.sendFile(filePath);
   } catch (error) {
