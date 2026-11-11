@@ -505,6 +505,113 @@ router.patch('/:eventId/requirements/:requirementId/edit', authenticateToken, as
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/events/:eventId/requirements/:requirementId
+// Event OWNER deletes a single requirement from a tagged department.
+// - Removes the requirement from departmentRequirements[dept]
+// - If the department has no remaining requirements, removes it from taggedDepartments
+// - This frees up availability for other events since the requirement no longer counts
+// - Emits real-time socket update so department views refresh instantly
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/:eventId/requirements/:requirementId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { eventId, requirementId } = req.params;
+    const userId = (req as any).user?._id;
+
+    // Find the event
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({
+        success: false,
+        message: 'Event not found'
+      });
+    }
+
+    // Authorization: only the event owner may delete requirements
+    if (!userId || event.createdBy.toString() !== userId.toString()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the event owner can delete requirements'
+      });
+    }
+
+    // Find and remove the requirement
+    let requirementFound = false;
+    let foundDept = '';
+    let removedReq: any = null;
+
+    for (const [dept, requirements] of Object.entries(event.departmentRequirements) as [string, any[]][]) {
+      const reqIndex = requirements.findIndex(r => r.id === requirementId);
+      if (reqIndex !== -1) {
+        removedReq = requirements[reqIndex];
+        requirements.splice(reqIndex, 1);
+        foundDept = dept;
+        requirementFound = true;
+
+        // If department has no more requirements, remove it entirely
+        if (requirements.length === 0) {
+          delete event.departmentRequirements[dept];
+          // Remove from taggedDepartments
+          event.taggedDepartments = event.taggedDepartments.filter(d => d !== dept);
+        }
+        break;
+      }
+    }
+
+    if (!requirementFound) {
+      return res.status(404).json({
+        success: false,
+        message: 'Requirement not found'
+      });
+    }
+
+    event.markModified('departmentRequirements');
+    event.markModified('taggedDepartments');
+    await event.save();
+
+    // Real-time update — notify department and event owner so both UIs refresh
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        const updatePayload = {
+          type: 'requirement-deleted',
+          notificationType: 'requirement-deleted',
+          eventId: (event._id as any).toString(),
+          eventTitle: event.eventTitle,
+          requirementId,
+          requirementName: removedReq?.name,
+          departmentName: foundDept,
+          updatedEvent: event,
+          timestamp: Date.now()
+        };
+
+        // Notify the department that owned this requirement
+        io.emit('requirement-deleted', updatePayload);
+
+        // Notify the event creator
+        io.to(`user-${event.createdBy}`).emit('requirement-deleted', updatePayload);
+
+        // Notify the user who deleted it
+        io.to(`user-${userId}`).emit('requirement-deleted', updatePayload);
+      }
+    } catch (_socketErr) {
+      // Non-critical — don't fail the HTTP response
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Requirement deleted successfully',
+      data: event
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to delete requirement',
+      error: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
 // DELETE /api/events/:eventId/attachment/:filename - Delete an attachment file from an event
 router.delete('/:eventId/attachment/:filename', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -1050,13 +1157,10 @@ router.post('/:eventId/add-department', authenticateToken, async (req: Request, 
         });
       }
 
-      // Prevent duplicate department tagging
-      if (event.taggedDepartments.includes(departmentName.trim())) {
-        return res.status(409).json({
-          success: false,
-          message: `Department "${departmentName}" is already tagged on this event`
-        });
-      }
+      // Allow adding requirements to already-tagged departments.
+      // The code below skips duplicate requirement names, so re-adding the
+      // same department only appends new requirements — it never overwrites
+      // existing ones or their approval status.
 
       // Verify the department actually exists and is visible
       const deptRecord = await Department.findOne({
@@ -1069,6 +1173,7 @@ router.post('/:eventId/add-department', authenticateToken, async (req: Request, 
       }
 
         const deptKey = departmentName.trim();
+        const isNewDepartment = !event.departmentRequirements[deptKey] || event.departmentRequirements[deptKey].length === 0;
 
         // Guard: do not overwrite existing requirements for this department
         if (!event.departmentRequirements[deptKey]) {
@@ -1119,8 +1224,8 @@ router.post('/:eventId/add-department', authenticateToken, async (req: Request, 
             const io = req.app.get('io');
             if(io) {
               const updatePayload = {
-                type: 'department-added',
-                notificationType: 'department-added',
+                type: isNewDepartment ? 'department-added' : 'requirements-added',
+                notificationType: isNewDepartment ? 'department-added' : 'requirements-added',
                 eventId: (event._id as any).toString(),
                 eventTitle: event.eventTitle,
                 departmentName: deptKey,
@@ -1130,15 +1235,18 @@ router.post('/:eventId/add-department', authenticateToken, async (req: Request, 
               };
 
               // Broadcast globally (admins, event owner, and newly tagged department)
-              io.emit('department-added', updatePayload);
+              const socketEvent = isNewDepartment ? 'department-added' : 'requirements-added';
+              io.emit(socketEvent, updatePayload);
 
               // Direct notification to event owner
-              io.to(`user-${event.createdBy}`).emit('department-added', updatePayload);
+              io.to(`user-${event.createdBy}`).emit(socketEvent, updatePayload);
 
               // Notify users in the newly added department so they see the event
               io.emit('new-notification', {
                 ...updatePayload,
-                message: `Your department has been added to event "${event.eventTitle}"`
+                message: isNewDepartment
+                  ? `Your department has been added to event "${event.eventTitle}"`
+                  : `New requirements have been added to event "${event.eventTitle}" for your department`
               });
             }
           } catch(_socketErr) {
