@@ -556,4 +556,240 @@ router.post('/cleanup-past', authenticateToken, async (req: Request, res: Respon
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PITO EQUIPMENT AVAILABILITY – date-range endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/resource-availability/pito/equipment
+ * Returns the PITO department's requirement list (from Department model).
+ * Any authenticated user can call this (needed by RequestEventPage).
+ */
+router.get('/pito/equipment', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const pitoDoc = await Department.findOne({ name: 'PITO' }).lean();
+    if (!pitoDoc) {
+      return res.json({ success: true, data: [] });
+    }
+
+    // Static PITO equipment list (mirrors the hardcoded list in RequestEventPage)
+    // This provides the authoritative list of manageable items.
+    const staticEquipment = [
+      { id: 'pito-led-wall-operator', name: 'LED Wall with Operator', type: 'service' },
+      { id: 'pito-led-wall',          name: 'LED Wall',               type: 'service' },
+      { id: 'pito-projector',         name: 'Projector with VGA',     type: 'service' },
+      { id: 'pito-internet',          name: 'Internet Connection',    type: 'service' },
+      { id: 'pito-tv',                name: 'TV',                     type: 'service' },
+      { id: 'pito-hdmi-cable',        name: '10-meter HDMI Cable',    type: 'service' },
+    ];
+
+    // Merge with any dynamic items stored in Department.requirements
+    const deptReqs: any[] = pitoDoc.requirements || [];
+    const extraItems = deptReqs
+      .filter((r: any) => r.isActive !== false)
+      .filter((r: any) => !staticEquipment.some(s => s.name.toLowerCase() === (r.text || '').toLowerCase()))
+      .map((r: any) => ({
+        id: String(r._id),
+        name: r.text,
+        type: r.type || 'service',
+      }));
+
+    return res.json({ success: true, data: [...staticEquipment, ...extraItems] });
+  } catch (error) {
+    console.error('Error fetching PITO equipment list:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/**
+ * GET /api/resource-availability/pito/schedules
+ * Returns all PITO unavailability schedules (date ranges).
+ * Query params: startDate (YYYY-MM-DD), endDate (YYYY-MM-DD) — optional filters.
+ */
+router.get('/pito/schedules', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    const query: any = { departmentName: 'PITO', isAvailable: false };
+    if (startDate && endDate) {
+      query.date = { $gte: String(startDate), $lte: String(endDate) };
+    } else if (startDate) {
+      query.date = { $gte: String(startDate) };
+    }
+
+    const records = await ResourceAvailability.find(query)
+      .populate('setBy', 'name email')
+      .sort({ requirementText: 1, date: 1 })
+      .lean();
+
+    // Group consecutive dates into schedules
+    // A "schedule" = { equipmentId, equipmentName, startDate, endDate, reason, records[] }
+    const grouped = new Map<string, any>();
+
+    for (const rec of records) {
+      const key = `${rec.requirementId}-${rec.notes}`;
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          id: key,
+          equipmentId: String(rec.requirementId),
+          equipmentName: rec.requirementText,
+          reason: rec.notes || '',
+          startDate: rec.date,
+          endDate: rec.date,
+          setBy: rec.setBy,
+          createdAt: rec.createdAt,
+        });
+      } else {
+        const entry = grouped.get(key)!;
+        if (rec.date < entry.startDate) entry.startDate = rec.date;
+        if (rec.date > entry.endDate) entry.endDate = rec.date;
+      }
+    }
+
+    return res.json({ success: true, data: Array.from(grouped.values()) });
+  } catch (error) {
+    console.error('Error fetching PITO schedules:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/**
+ * POST /api/resource-availability/pito/schedules
+ * Create/update an unavailability schedule for a PITO equipment item over a date range.
+ * Body: { equipmentId, equipmentName, startDate, endDate, reason }
+ * Only PITO department users can call this.
+ */
+router.post('/pito/schedules', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user = req.user as any;
+    const userDept = (user?.department || '').trim().toUpperCase();
+    const userRole = (user?.role || '').trim().toLowerCase();
+
+    if (userDept !== 'PITO' && userRole !== 'admin' && userRole !== 'superadmin') {
+      return res.status(403).json({ success: false, message: 'Only PITO users can manage equipment availability' });
+    }
+
+    const { equipmentId, equipmentName, startDate, endDate, reason } = req.body;
+
+    if (!equipmentId || !equipmentName || !startDate || !endDate) {
+      return res.status(400).json({ success: false, message: 'equipmentId, equipmentName, startDate, and endDate are required' });
+    }
+
+    // Build array of all dates in range
+    const dates: string[] = [];
+    const cursor = new Date(startDate + 'T00:00:00');
+    const last = new Date(endDate + 'T00:00:00');
+    while (cursor <= last) {
+      dates.push(cursor.toISOString().split('T')[0]);
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    if (dates.length === 0) {
+      return res.status(400).json({ success: false, message: 'Invalid date range' });
+    }
+
+    // Upsert one record per date
+    const pitoDoc = await Department.findOne({ name: 'PITO' }).lean() as any;
+    const deptId = pitoDoc?._id || new mongoose.Types.ObjectId();
+
+    const ops = dates.map(date => ({
+      updateOne: {
+        filter: { departmentName: 'PITO', requirementId: equipmentId, date },
+        update: {
+          $set: {
+            departmentId: deptId,
+            departmentName: 'PITO',
+            requirementId: equipmentId,
+            requirementText: equipmentName,
+            date,
+            isAvailable: false,
+            notes: reason || '',
+            quantity: 0,
+            maxCapacity: 1,
+            setBy: user._id,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        upsert: true,
+      },
+    }));
+
+    await ResourceAvailability.bulkWrite(ops);
+
+    return res.json({ success: true, message: `Equipment marked unavailable for ${dates.length} day(s)` });
+  } catch (error) {
+    console.error('Error creating PITO schedule:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/**
+ * DELETE /api/resource-availability/pito/schedules
+ * Remove an unavailability schedule for a PITO equipment item over a date range.
+ * Body: { equipmentId, startDate, endDate }
+ * Only PITO department users can call this.
+ */
+router.delete('/pito/schedules', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const user = req.user as any;
+    const userDept = (user?.department || '').trim().toUpperCase();
+    const userRole = (user?.role || '').trim().toLowerCase();
+
+    if (userDept !== 'PITO' && userRole !== 'admin' && userRole !== 'superadmin') {
+      return res.status(403).json({ success: false, message: 'Only PITO users can manage equipment availability' });
+    }
+
+    const { equipmentId, startDate, endDate } = req.body;
+
+    if (!equipmentId || !startDate || !endDate) {
+      return res.status(400).json({ success: false, message: 'equipmentId, startDate, and endDate are required' });
+    }
+
+    const result = await ResourceAvailability.deleteMany({
+      departmentName: 'PITO',
+      requirementId: equipmentId,
+      date: { $gte: startDate, $lte: endDate },
+    });
+
+    return res.json({ success: true, message: `Removed ${result.deletedCount} unavailability record(s)` });
+  } catch (error) {
+    console.error('Error deleting PITO schedule:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/**
+ * POST /api/resource-availability/pito/check
+ * Check which PITO equipment items are unavailable for a given date range.
+ * Body: { startDate, endDate }
+ * Returns: { unavailable: string[] } — list of equipment names that have ANY unavailability record in range.
+ * Any authenticated user can call this (needed by RequestEventPage).
+ */
+router.post('/pito/check', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate } = req.body;
+    if (!startDate) {
+      return res.status(400).json({ success: false, message: 'startDate is required' });
+    }
+
+    const end = endDate || startDate;
+
+    const records = await ResourceAvailability.find({
+      departmentName: 'PITO',
+      isAvailable: false,
+      date: { $gte: startDate, $lte: end },
+    }).select('requirementText requirementId').lean();
+
+    const unavailableNames = [...new Set(records.map((r: any) => r.requirementText))];
+    const unavailableIds = [...new Set(records.map((r: any) => String(r.requirementId)))];
+
+    return res.json({ success: true, unavailableNames, unavailableIds });
+  } catch (error) {
+    console.error('Error checking PITO equipment availability:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
 export default router;
+
